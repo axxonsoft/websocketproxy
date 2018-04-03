@@ -2,13 +2,14 @@
 package websocketproxy
 
 import (
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/gorilla/websocket"
+	"os"
 )
 
 var (
@@ -22,6 +23,12 @@ var (
 	// DefaultDialer is a dialer with all fields set to the default zero values.
 	DefaultDialer = websocket.DefaultDialer
 )
+
+var DefaultLogger logrus.FieldLogger = &logrus.Logger{
+	Out:       os.Stdout,
+	Formatter: &logrus.JSONFormatter{},
+	Level:     logrus.DebugLevel,
+}
 
 // WebsocketProxy is an HTTP Handler that takes an incoming WebSocket
 // connection and proxies it to another server.
@@ -43,6 +50,8 @@ type WebsocketProxy struct {
 	//  Dialer contains options for connecting to the backend WebSocket server.
 	//  If nil, DefaultDialer is used.
 	Dialer *websocket.Dialer
+
+	Logger logrus.FieldLogger
 }
 
 // ProxyHandler returns a new http.Handler interface that reverse proxies the
@@ -60,20 +69,26 @@ func NewProxy(target *url.URL) *WebsocketProxy {
 		u.RawQuery = r.URL.RawQuery
 		return &u
 	}
-	return &WebsocketProxy{Backend: backend}
+	return &WebsocketProxy{
+		Backend: backend,
+		Logger:  DefaultLogger,
+	}
 }
 
 // ServeHTTP implements the http.Handler that proxies WebSocket connections.
 func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if w.Logger == nil {
+		w.Logger = DefaultLogger
+	}
 	if w.Backend == nil {
-		log.Println("websocketproxy: backend function is not defined")
+		w.Logger.Error("websocketproxy: backend function is not defined")
 		http.Error(rw, "internal server error (code: 1)", http.StatusInternalServerError)
 		return
 	}
 
 	backendURL := w.Backend(req)
 	if backendURL == nil {
-		log.Println("websocketproxy: backend URL is nil")
+		w.Logger.Error("websocketproxy: backend URL is nil")
 		http.Error(rw, "internal server error (code: 2)", http.StatusInternalServerError)
 		return
 	}
@@ -132,7 +147,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// http://tools.ietf.org/html/draft-ietf-hybi-websocket-multiplexing-01
 	connBackend, resp, err := dialer.Dial(backendURL.String(), requestHeader)
 	if err != nil {
-		log.Printf("websocketproxy: couldn't dial to remote backend url %s\n", err)
+		w.Logger.WithError(err).Error("websocketproxy: couldn't dial to remote backend url")
 		return
 	}
 	defer connBackend.Close()
@@ -155,7 +170,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Also pass the header that we gathered from the Dial handshake.
 	connPub, err := upgrader.Upgrade(rw, req, upgradeHeader)
 	if err != nil {
-		log.Printf("websocketproxy: couldn't upgrade %s\n", err)
+		w.Logger.WithError(err).Error("websocketproxy: couldn't upgrade")
 		return
 	}
 	defer connPub.Close()
@@ -167,15 +182,26 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		for {
 			msgType, msg, err := src.ReadMessage()
 			if err != nil {
-				log.Printf("websocketproxy: error when copying from %s to %s using ReadMessage: %v", srcName, dstName, err)
+				w.Logger.
+					WithError(err).
+					WithFields(logrus.Fields{
+						"src": srcName,
+						"dst": dstName,
+					}).
+					Info("websocketproxy: error when copying using ReadMessage")
+
 				break
 			}
 			err = dst.WriteMessage(msgType, msg)
 			if err != nil {
-				log.Printf("websocketproxy: error when copying from %s to %s using WriteMessage: %v", srcName, dstName, err)
+				w.Logger.
+					WithError(err).
+					WithFields(logrus.Fields{
+						"src": srcName,
+						"dst": dstName,
+					}).
+					Info("websocketproxy: error when copying using WriteMessage")
 				break
-			} else {
-				log.Printf("websocketproxy: copying from %s to %s completed without error.", srcName, dstName)
 			}
 		}
 		errc <- err
